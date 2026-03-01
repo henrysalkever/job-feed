@@ -699,7 +699,7 @@
         <input type="text" class="form-input" id="board-url"  placeholder="Career page URL">
         <button class="btn-add-board" id="board-add-btn">+ Add board &amp; fetch</button>
         <div class="ats-hint">
-          Native support for <strong>Greenhouse</strong>, <strong>Lever</strong>, <strong>Ashby</strong>, <strong>Workable</strong>, and <strong>SmartRecruiters</strong>. Other pages are parsed automatically.
+          Native support for <strong>Greenhouse</strong>, <strong>Lever</strong>, <strong>Ashby</strong>, <strong>Workday</strong>, <strong>Workable</strong>, and <strong>SmartRecruiters</strong>. Other pages are parsed automatically.
         </div>
       </div>
     </div>
@@ -745,6 +745,7 @@ function detectAts(url) {
   if (/ashbyhq\.com|jobs\.ashbyhq/.test(url))        return 'ashby';
   if (/workable\.com/.test(url))                      return 'workable';
   if (/smartrecruiters\.com/.test(url))               return 'smartrecruiters';
+  if (/myworkdayjobs\.com|myworkdaysite\.com/.test(url)) return 'workday';
   return 'generic';
 }
 
@@ -944,6 +945,79 @@ async function fetchSmartrecruiters(board) {
   }));
 }
 
+async function fetchWorkday(board) {
+  // Workday exposes an undocumented internal search API at:
+  // https://{subdomain}.wd{N}.myworkdayjobs.com/wday/cxs/{subdomain}/{site}/jobs
+  // We POST a JSON body to get paginated results without needing a browser.
+
+  const url = board.url;
+
+  // Parse: https://blackrock.wd1.myworkdayjobs.com/BlackRock_Professional
+  // → subdomain = blackrock, instance = wd1, site = BlackRock_Professional
+  const m = url.match(/^https?:\/\/([^.]+)\.(wd\d+)\.myworkdayjobs\.com(?:\/[^/]*)?\/([^/?#]+)/);
+  if (!m) {
+    // Try alternate: myworkdaysite.com
+    const m2 = url.match(/^https?:\/\/([^.]+)\.(wd\d+)\.myworkdaysite\.com(?:\/[^/]*)?\/([^/?#]+)/);
+    if (!m2) throw new Error('Cannot parse Workday URL. Expected format: https://company.wd1.myworkdayjobs.com/SiteName');
+    return fetchWorkdayApi(board, m2[1], m2[2], m2[3], 'myworkdaysite.com');
+  }
+  return fetchWorkdayApi(board, m[1], m[2], m[3], 'myworkdayjobs.com');
+}
+
+async function fetchWorkdayApi(board, subdomain, instance, site, domain) {
+  const apiBase = `https://${subdomain}.${instance}.${domain}/wday/cxs/${subdomain}/${site}/jobs`;
+
+  let offset = 0;
+  const limit = 20;
+  const allItems = [];
+
+  // Paginate up to 10 pages (200 jobs max)
+  for (let page = 0; page < 10; page++) {
+    const body = JSON.stringify({
+      appliedFacets: {},
+      limit,
+      offset,
+      searchText: ''
+    });
+
+    const proxyUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(apiBase)}`;
+    const res = await fetch(proxyUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body
+    });
+
+    if (!res.ok) throw new Error(`Workday API HTTP ${res.status}`);
+    const text = await res.text();
+    let data;
+    try { data = JSON.parse(text); } catch(e) { throw new Error('Workday returned non-JSON response — site may block this proxy'); }
+
+    const jobs = data.jobPostings || [];
+    if (jobs.length === 0) break;
+    allItems.push(...jobs);
+    if (allItems.length >= (data.total || 0)) break;
+    offset += limit;
+  }
+
+  if (allItems.length === 0) throw new Error('Workday returned 0 jobs — the site slug may be wrong, or the board is empty');
+
+  return allItems.map(j => ({
+    ...jobBase(board),
+    id: `wd-${j.bulletFields?.[0] || uid()}`,
+    title: j.title,
+    location: j.locationsText || '',
+    url: j.externalPath
+      ? `https://${subdomain}.${instance}.myworkdayjobs.com${j.externalPath}`
+      : board.url,
+    postedDate: parseDate(j.postedOn),
+    level: classifyLevel(j.title),
+    remote: isRemote(j.title, j.locationsText || ''),
+    intern: isIntern(j.title),
+    jobType: j.jobPostingId ? 'Full-time' : 'Full-time',
+    ats: 'Workday'
+  }));
+}
+
 async function fetchGeneric(board) {
   const html = await fetchViaProxy(board.url);
   const doc = new DOMParser().parseFromString(html, 'text/html');
@@ -1042,6 +1116,7 @@ async function fetchBoardJobs(board) {
     case 'ashby':           return fetchAshby(board);
     case 'workable':        return fetchWorkable(board);
     case 'smartrecruiters': return fetchSmartrecruiters(board);
+    case 'workday':         return fetchWorkday(board);
     default:                return fetchGeneric(board);
   }
 }
